@@ -1,0 +1,22 @@
+[project]
+name = "pebble"
+version = "0.0.1"
+description = "Fork-consistent encrypted folder."
+requires-python = ">=3.11"
+dependencies = [
+    "argon2-cffi>=23.1.0",
+    "cryptography>=43",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
