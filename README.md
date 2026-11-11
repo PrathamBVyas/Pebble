@@ -28,3 +28,13 @@ pebble mount CIPHER MOUNTPOINT --state STATE --witness WITNESS --password-file F
 ```
 
 Mounting needs libfuse 3 and `/dev/fuse`. This was tried on Linux 6.12 with libfuse 3.14.
+
+A second person gets a keybag and is granted one folder. `--keybag` mounts only the folders that person can still open. `revoke` mints a new listing key for that folder. A later commit that pastes the old grant list back is refused.
+
+```
+pebble keygen --password-file FILE --keybag KEYBAG --public PUBLIC
+pebble add-user CIPHER --name NAME --keybag KEYBAG --public PUBLIC --password-file FILE
+pebble share CIPHER FOLDER NAME --password-file FILE
+pebble revoke CIPHER FOLDER NAME --password-file FILE
+pebble mount CIPHER MOUNTPOINT --keybag KEYBAG --password-file FILE
+```

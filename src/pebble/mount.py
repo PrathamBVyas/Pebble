@@ -21,19 +21,19 @@ import trio
 
 from pebble.commit import load_commit
 from pebble.errors import FormatError
+from pebble.grants import member_volume
 from pebble.secret import wipe_buffer
-from pebble.tree import Dir, _check_name, load
+from pebble.tree import Dir, _check_name
 from pebble.vault import (
     EXIT_OK,
     EXIT_REWIND,
     EXIT_SPLIT,
     Layout,
     _judge,
-    _own_tree,
     _session,
     commit_directory,
-    wipe_directory,
 )
+from pebble.volume import VDir, load_volume, wipe_volume
 
 
 def mount_readonly(
@@ -51,9 +51,8 @@ def mount_readonly(
         if shown is None:
             return EXIT_REWIND
         listing = load_commit(layout.store, shown).listing.hex()
-        directory = load(layout.store, listing, bytes(root_key))
-        _own_tree(directory)
-        writable = read_write and code != EXIT_SPLIT
+        directory = load_volume(layout.store, listing, bytes(root_key))
+        writable = read_write and code == EXIT_OK
 
         def publish() -> None:
             commit_directory(layout, opened, root_key, directory)
@@ -73,8 +72,49 @@ def mount_readonly(
             pyfuse3.close()
         finally:
             operations.wipe()
-            wipe_directory(directory)
+            if isinstance(directory, VDir):
+                wipe_volume(directory)
         return EXIT_OK
+
+
+def mount_member(
+    layout: Layout,
+    password: bytearray,
+    keybag: Path,
+    mountpoint: Path,
+    *,
+    allow_unwitnessed: bool = False,
+) -> int:
+    """Serve the folders a member can still open. The mount is read-only."""
+    from pebble.keybag import Keybag
+
+    opened = Keybag.unlock(password, Path(keybag).read_bytes())
+    directory = None
+    try:
+        code, message, shown = _judge(layout, opened, allow_unwitnessed=allow_unwitnessed)
+        print(message)
+        if shown is None:
+            return EXIT_REWIND
+        directory = member_volume(layout.store, shown, opened)
+        operations = _Operations(directory, None)
+        options = set(pyfuse3.default_options)
+        options.add("ro")
+        options.add("fsname=pebble")
+        pyfuse3.init(operations, str(mountpoint), options)
+        try:
+            trio.run(pyfuse3.main)
+        except Exception:
+            pyfuse3.close(unmount=False)
+            raise
+        else:
+            pyfuse3.close()
+        finally:
+            operations.wipe()
+        return EXIT_OK
+    finally:
+        opened.close()
+        if isinstance(directory, VDir):
+            wipe_volume(directory)
 
 
 class _Node:
@@ -113,7 +153,10 @@ class _Operations(pyfuse3.Operations):
             if not isinstance(body, bytearray):
                 body = bytearray(body)
                 directory.files[name] = body
-            self._nodes[child_ino] = _Node(inode, False, body, None)
+            file_node = _Node(inode, False, body, None)
+            file_node.file_parent = directory
+            file_node.file_name = name
+            self._nodes[child_ino] = file_node
 
     def _alloc(self) -> int:
         self._next += 1
@@ -169,7 +212,10 @@ class _Operations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO) from None
 
     def _drop_file(self, directory: _Node, name: str) -> None:
-        body = directory.tree.files.pop(name)
+        if isinstance(directory.tree, VDir) and name in directory.tree.meta:
+            body = directory.tree.drop_file(name)
+        else:
+            body = directory.tree.files.pop(name)
         inode = directory.children.pop(name)
         self._nodes.pop(inode, None)
         if isinstance(body, bytearray):
@@ -243,6 +289,9 @@ class _Operations(pyfuse3.Operations):
         if end > len(data):
             data.extend(b"\x00" * (end - len(data)))
         data[off:end] = buf
+        parent = getattr(node, "file_parent", None)
+        if isinstance(parent, VDir):
+            parent.touch(node.file_name)
         return len(buf)
 
     async def flush(self, fh):
@@ -269,6 +318,9 @@ class _Operations(pyfuse3.Operations):
                 del data[size:]
             elif size > len(data):
                 data.extend(b"\x00" * (size - len(data)))
+            parent = getattr(node, "file_parent", None)
+            if isinstance(parent, VDir):
+                parent.touch(node.file_name)
         return self._attr(inode)
 
     async def create(self, parent_inode, name, mode, flags, ctx):
@@ -278,13 +330,22 @@ class _Operations(pyfuse3.Operations):
         if text in parent.tree.dirs:
             raise pyfuse3.FUSEError(errno.EEXIST)
         if text not in parent.tree.files:
-            parent.tree.files[text] = bytearray()
+            if isinstance(parent.tree, VDir):
+                body = parent.tree.add_file(text, b"")
+            else:
+                body = bytearray()
+                parent.tree.files[text] = body
             inode = self._alloc()
             parent.children[text] = inode
-            self._nodes[inode] = _Node(parent_inode, False, parent.tree.files[text], None)
+            created = _Node(parent_inode, False, body, None)
+            created.file_parent = parent.tree
+            created.file_name = text
+            self._nodes[inode] = created
         else:
             inode = parent.children[text]
             del parent.tree.files[text][:]
+            if isinstance(parent.tree, VDir):
+                parent.tree.touch(text)
         info = pyfuse3.FileInfo()
         info.fh = inode
         info.direct_io = True
@@ -296,8 +357,11 @@ class _Operations(pyfuse3.Operations):
         text = self._component(name)
         if text in parent.children:
             raise pyfuse3.FUSEError(errno.EEXIST)
-        child = Dir()
-        parent.tree.dirs[text] = child
+        if isinstance(parent.tree, VDir):
+            child = parent.tree.add_dir(text)
+        else:
+            child = Dir()
+            parent.tree.dirs[text] = child
         inode = self._alloc()
         parent.children[text] = inode
         self._nodes[inode] = _Node(parent_inode, True, bytearray(), child)
@@ -368,13 +432,19 @@ class _Operations(pyfuse3.Operations):
             if noreplace:
                 raise pyfuse3.FUSEError(errno.EEXIST)
             self._drop_file(dest, new)
-        body = source.tree.files.pop(old)
-        inode = source.children.pop(old)
-        dest.tree.files[new] = body
+        if isinstance(source.tree, VDir) and isinstance(dest.tree, VDir):
+            body = source.tree.move_file(old, dest.tree, new)
+            inode = source.children.pop(old)
+        else:
+            body = source.tree.files.pop(old)
+            inode = source.children.pop(old)
+            dest.tree.files[new] = body
         dest.children[new] = inode
         node = self._nodes[inode]
         node.parent = dest_ino
         node.data = body
+        node.file_parent = dest.tree
+        node.file_name = new
 
     def _rename_dir(self, source, old, dest, dest_ino, new, noreplace) -> None:
         if new in dest.tree.files:

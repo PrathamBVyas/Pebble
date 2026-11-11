@@ -18,8 +18,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from pebble.commit import create_commit, load_commit
+from pebble.commit import create_commit, create_granted_commit, load_commit
 from pebble.errors import AuthenticationError, FormatError
+from pebble.grants import check_grant_history, grants_for
 from pebble.history import classify
 from pebble.keybag import Keybag
 from pebble.receipt import write_receipt
@@ -27,11 +28,13 @@ from pebble.seal import seal
 from pebble.secret import wipe_buffer
 from pebble.store import Kind, Store
 from pebble.tree import Dir, load, save
+from pebble.volume import VDir, load_volume, store_volume, walk
 from pebble.witness import append_view, read_views
 
 EXIT_OK = 0
 EXIT_REWIND = 2
 EXIT_SPLIT = 3
+EXIT_GRANT = 4
 
 
 class VaultError(Exception):
@@ -81,7 +84,7 @@ def put(layout: Layout, password: bytearray, local: Path, vault_path: str) -> No
         del opened
         directory = _editable(layout, root_key)
         _place(directory, _parts(vault_path), data)
-        listing = save(layout.store, directory, bytes(root_key), sync=False)
+        listing = _store_tree(layout, directory)
         layout.store.sync()
         _atomic_write(layout.cipher / "STAGED", (listing + "\n").encode())
 
@@ -119,8 +122,8 @@ def commit(layout: Layout, password: bytearray) -> str:
         raise VaultError("nothing to commit")
     listing = _hash_line(staged_path, "STAGED")
     with _session(layout, password) as (opened, root_key):
-        del root_key
-        commit_id = commit_listing(layout, opened, listing)
+        grants = _refresh_grants(layout, opened, root_key, listing)
+        commit_id = commit_listing(layout, opened, listing, grants=grants)
         staged_path.unlink()
         return commit_id
 
@@ -177,6 +180,14 @@ def _judge(layout: Layout, opened, *, allow_unwitnessed: bool) -> tuple[int, str
         parents=parents,
     )
     if verdict.kind == "update":
+        try:
+            check_grant_history(layout.store, verdict.head)
+        except FormatError as exc:
+            if "grant history" not in str(exc):
+                raise
+            accepted = _read_accepted(layout)
+            previous = accepted[-1] if accepted else None
+            return EXIT_GRANT, "grant history is not valid", previous
         _accept(layout, verdict.head)
         _witness(layout, opened, verdict.head)
         return EXIT_OK, f"update {verdict.head}", verdict.head
@@ -197,11 +208,13 @@ def _own_tree(directory: Dir) -> None:
         _own_tree(child)
 
 
-def commit_listing(layout: Layout, opened, listing: str) -> str:
+def commit_listing(layout: Layout, opened, listing: str, *, grants: tuple = ()) -> str:
     """Sign one listing, sync the new objects once, and rename HEAD."""
     parent = _read_head(layout)
     parents = (parent,) if parent else ()
-    commit_id = _sign_and_store(layout, opened, parents=parents, listing=listing, sync=False)
+    commit_id = _sign_and_store(
+        layout, opened, parents=parents, listing=listing, sync=False, grants=grants
+    )
     _durable_head(layout, commit_id)
     _accept(layout, commit_id)
     _witness(layout, opened, commit_id)
@@ -209,20 +222,163 @@ def commit_listing(layout: Layout, opened, listing: str) -> str:
 
 
 def commit_directory(layout: Layout, opened, root_key: bytearray, directory: Dir) -> str:
-    """Seal a tree and publish it as one save."""
-    listing = save(layout.store, directory, bytes(root_key), sync=False)
-    return commit_listing(layout, opened, listing)
+    """Seal a tree and publish it as one save. Existing file keys are kept."""
+    if isinstance(directory, VDir):
+        listing = store_volume(layout.store, directory, sync=False)
+        grants = _grants_from_volume(layout, opened, directory)
+    else:
+        listing = save(layout.store, directory, bytes(root_key), sync=False)
+        grants = ()
+    return commit_listing(layout, opened, listing, grants=grants)
+
+
+def keygen(password: bytearray, keybag_path: Path, public_path: Path) -> None:
+    """Write a password keybag and the two public keys a share needs."""
+    blob, opened = Keybag.create(password)
+    try:
+        _atomic_write(keybag_path, blob)
+        _atomic_write(public_path, opened.signing_public + opened.exchange_public)
+    finally:
+        opened.close()
+
+
+def add_user(
+    layout: Layout, password: bytearray, name: str, keybag_path: Path, public_path: Path
+) -> None:
+    """Copy a member's keybag and public keys into the cipher directory."""
+    _member_name(name)
+    public = Path(public_path).read_bytes()
+    if len(public) != 64:
+        raise VaultError("member public key is not valid")
+    with _session(layout, password) as (opened, root_key):
+        del opened, root_key
+        _atomic_write(layout.cipher / "keybags" / name, Path(keybag_path).read_bytes())
+        _atomic_write(layout.cipher / "members" / name, public)
+
+
+def share(layout: Layout, password: bytearray, path: str, name: str) -> str:
+    """Seal one folder key to a member. The vault root stays with the owner."""
+    if not path:
+        raise VaultError("cannot share the vault root")
+    recipient = _member_exchange(layout, name)
+    with _session(layout, password) as (opened, root_key):
+        volume = _editable(layout, root_key)
+        try:
+            folder = walk(volume, path)
+        except KeyError as exc:
+            raise VaultError("path is not a folder") from exc
+        if folder is volume:
+            raise VaultError("cannot share the vault root")
+        if folder.listing_id is None or folder.dirty:
+            store_volume(layout.store, volume, sync=False)
+        previous = _parent_grants(layout)
+        recipients = _recipients(previous, path)
+        recipients.add(opened.exchange_public)
+        recipients.add(recipient)
+        grants = grants_for(previous, volume, opened, path, recipients=recipients)
+        return commit_listing(layout, opened, volume.listing_id, grants=grants)
+
+
+def revoke(layout: Layout, password: bytearray, path: str, name: str) -> str:
+    """Mint a new listing key for one folder and stop sealing it to name."""
+    removed = _member_exchange(layout, name)
+    with _session(layout, password) as (opened, root_key):
+        volume = _editable(layout, root_key)
+        try:
+            folder = walk(volume, path)
+        except KeyError as exc:
+            raise VaultError("path is not a folder") from exc
+        wipe_buffer(folder.key)
+        folder.key = bytearray(secrets.token_bytes(32))
+        folder.dirty = True
+        listing = store_volume(layout.store, volume, sync=False)
+        previous = _parent_grants(layout)
+        recipients = _recipients(previous, path)
+        recipients.add(opened.exchange_public)
+        recipients.discard(removed)
+        grants = grants_for(previous, volume, opened, path, recipients=recipients)
+        return commit_listing(layout, opened, listing, grants=grants)
 
 
 def _sign_and_store(
-    layout: Layout, opened, *, parents: tuple[str, ...], listing: str, sync: bool
+    layout: Layout,
+    opened,
+    *,
+    parents: tuple[str, ...],
+    listing: str,
+    sync: bool,
+    grants: tuple = (),
 ) -> str:
     seed = opened._copy_signing()
     try:
-        blob = create_commit(parents=parents, listing=listing, seed=seed)
+        if grants:
+            blob = create_granted_commit(parents=parents, listing=listing, seed=seed, grants=grants)
+        else:
+            blob = create_commit(parents=parents, listing=listing, seed=seed)
     finally:
         wipe_buffer(seed)
     return layout.store.put(blob, kind=Kind.META, sync=sync)
+
+
+def _store_tree(layout: Layout, directory: Dir) -> str:
+    if isinstance(directory, VDir):
+        return store_volume(layout.store, directory, sync=False)
+    raise VaultError("directory is not valid")
+
+
+def _refresh_grants(layout: Layout, opened, root_key: bytearray, listing: str) -> tuple:
+    previous = _parent_grants(layout)
+    if not previous:
+        return ()
+    volume = load_volume(layout.store, listing, bytes(root_key))
+    try:
+        return _grants_from_volume(layout, opened, volume, previous=previous)
+    finally:
+        from pebble.volume import wipe_volume
+
+        wipe_volume(volume)
+
+
+def _grants_from_volume(layout: Layout, opened, volume: VDir, previous: tuple | None = None) -> tuple:
+    if previous is None:
+        previous = _parent_grants(layout)
+    if not previous:
+        return ()
+    current = previous
+    seen: set[bytes] = set()
+    for grant in previous:
+        if grant.path in seen:
+            continue
+        seen.add(grant.path)
+        path = grant.path.decode("utf-8")
+        recipients = _recipients(current, path)
+        current = grants_for(current, volume, opened, path, recipients=recipients)
+    return current
+
+
+def _parent_grants(layout: Layout) -> tuple:
+    head = _read_head(layout)
+    if head is None:
+        return ()
+    return load_commit(layout.store, head).grants
+
+
+def _recipients(grants: tuple, path: str) -> set[bytes]:
+    raw = path.encode("utf-8")
+    return {grant.recipient for grant in grants if grant.path == raw}
+
+
+def _member_exchange(layout: Layout, name: str) -> bytes:
+    _member_name(name)
+    public = (layout.cipher / "members" / name).read_bytes()
+    if len(public) != 64:
+        raise VaultError("member public key is not valid")
+    return public[32:]
+
+
+def _member_name(name: str) -> None:
+    if not name or len(name) > 64 or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in name):
+        raise VaultError("member name is not valid")
 
 
 def _session(layout: Layout, password: bytearray):
@@ -255,15 +411,15 @@ class _Unlock:
             self._opened = None
 
 
-def _editable(layout: Layout, root_key: bytearray) -> Dir:
+def _editable(layout: Layout, root_key: bytearray) -> VDir:
     staged = layout.cipher / "STAGED"
     if staged.is_file():
-        return load(layout.store, _hash_line(staged, "STAGED"), bytes(root_key))
+        return load_volume(layout.store, _hash_line(staged, "STAGED"), bytes(root_key))
     head = _read_head(layout)
     if head is None:
-        return Dir()
+        return VDir(bytes(root_key))
     listing = load_commit(layout.store, head).listing.hex()
-    return load(layout.store, listing, bytes(root_key))
+    return load_volume(layout.store, listing, bytes(root_key))
 
 
 def _place(directory: Dir, parts: tuple[str, ...], data: bytes) -> None:
@@ -273,13 +429,26 @@ def _place(directory: Dir, parts: tuple[str, ...], data: bytes) -> None:
             raise VaultError("path is not valid")
         child = node.dirs.get(part)
         if child is None:
-            child = Dir()
-            node.dirs[part] = child
+            if isinstance(node, VDir):
+                child = node.add_dir(part)
+            else:
+                child = Dir()
+                node.dirs[part] = child
         node = child
     name = parts[-1]
     if name in node.dirs:
         raise VaultError("path is not valid")
-    node.files[name] = data
+    if isinstance(node, VDir):
+        if name in node.files:
+            old = node.files[name]
+            node.files[name] = bytearray(data)
+            if isinstance(old, bytearray):
+                wipe_buffer(old)
+            node.touch(name)
+        else:
+            node.add_file(name, data)
+    else:
+        node.files[name] = data
 
 
 def _walk(directory: Dir, vault_path: str) -> Dir:

@@ -13,9 +13,22 @@ import sys
 from pathlib import Path
 
 from pebble.errors import CryptoError, PasswordError
-from pebble.mount import mount_readonly
+from pebble.mount import mount_member, mount_readonly
 from pebble.receipt import verify_receipt
-from pebble.vault import EXIT_OK, Layout, VaultError, commit, init, ls, put, status
+from pebble.vault import (
+    EXIT_OK,
+    Layout,
+    VaultError,
+    add_user,
+    commit,
+    init,
+    keygen,
+    ls,
+    put,
+    revoke,
+    share,
+    status,
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -57,7 +70,30 @@ def _run(argv: list[str] | None) -> int:
     mount_cmd.add_argument("mountpoint")
     mount_cmd.add_argument("--allow-unwitnessed", action="store_true")
     mount_cmd.add_argument("--read-write", action="store_true")
+    mount_cmd.add_argument("--keybag")
     mount_cmd.set_defaults(func=_cmd_mount)
+
+    keygen_cmd = sub.add_parser("keygen")
+    keygen_cmd.add_argument("--password-file")
+    keygen_cmd.add_argument("--keybag", required=True)
+    keygen_cmd.add_argument("--public", required=True)
+    keygen_cmd.set_defaults(func=_cmd_keygen)
+
+    user_cmd = _vault_parser(sub, "add-user")
+    user_cmd.add_argument("--name", required=True)
+    user_cmd.add_argument("--keybag", required=True)
+    user_cmd.add_argument("--public", required=True)
+    user_cmd.set_defaults(func=_cmd_user)
+
+    share_cmd = _vault_parser(sub, "share")
+    share_cmd.add_argument("path")
+    share_cmd.add_argument("name")
+    share_cmd.set_defaults(func=_cmd_share)
+
+    revoke_cmd = _vault_parser(sub, "revoke")
+    revoke_cmd.add_argument("path")
+    revoke_cmd.add_argument("name")
+    revoke_cmd.set_defaults(func=_cmd_revoke)
 
     proof = sub.add_parser("verify-proof")
     proof.add_argument("receipt")
@@ -126,6 +162,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _cmd_mount(args: argparse.Namespace) -> int:
     password = _password(args)
     try:
+        if args.keybag:
+            return mount_member(
+                _layout(args),
+                password,
+                Path(args.keybag),
+                Path(args.mountpoint),
+                allow_unwitnessed=args.allow_unwitnessed,
+            )
         return mount_readonly(
             _layout(args),
             password,
@@ -135,6 +179,42 @@ def _cmd_mount(args: argparse.Namespace) -> int:
         )
     finally:
         _wipe_password(password)
+
+
+def _cmd_keygen(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        keygen(password, Path(args.keybag), Path(args.public))
+    finally:
+        _wipe_password(password)
+    return EXIT_OK
+
+
+def _cmd_user(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        add_user(_layout(args), password, args.name, Path(args.keybag), Path(args.public))
+    finally:
+        _wipe_password(password)
+    return EXIT_OK
+
+
+def _cmd_share(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        print(share(_layout(args), password, args.path, args.name))
+    finally:
+        _wipe_password(password)
+    return EXIT_OK
+
+
+def _cmd_revoke(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        print(revoke(_layout(args), password, args.path, args.name))
+    finally:
+        _wipe_password(password)
+    return EXIT_OK
 
 
 def _cmd_proof(args: argparse.Namespace) -> int:
