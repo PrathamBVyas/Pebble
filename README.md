@@ -20,3 +20,11 @@ pebble verify-proof RECEIPT
 ```
 
 `status` exits 0 on an update, 2 on a rewind, and 3 on a split. `verify-proof` checks a receipt with no password.
+
+A read-only mount shows the committed files. It does not move HEAD. Unmount with `fusermount3 -u`.
+
+```
+pebble mount CIPHER MOUNTPOINT --state STATE --witness WITNESS --password-file FILE
+```
+
+Mounting needs libfuse 3 and `/dev/fuse`. This was tried on Linux 6.12 with libfuse 3.14.

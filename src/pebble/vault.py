@@ -131,34 +131,74 @@ def commit(layout: Layout, password: bytearray) -> str:
 
 def status(layout: Layout, password: bytearray, *, allow_unwitnessed: bool = False) -> tuple[int, str]:
     """Classify HEAD. Update remembers the tip. Rewind and split do not."""
+    with _session(layout, password) as (opened, root_key):
+        del root_key
+        code, message, _shown = _judge(layout, opened, allow_unwitnessed=allow_unwitnessed)
+        return code, message
+
+
+def open_committed(
+    layout: Layout, password: bytearray, *, allow_unwitnessed: bool = False
+) -> tuple[int, str, Dir | None]:
+    """Classify HEAD and decrypt the tree a mount may show.
+
+    A rewind returns no tree. An update shows the tip. A split shows the
+    accepted head, not the forked tip. File bodies are bytearrays so the
+    caller can wipe them.
+    """
+    with _session(layout, password) as (opened, root_key):
+        code, message, shown = _judge(layout, opened, allow_unwitnessed=allow_unwitnessed)
+        if shown is None:
+            return code, message, None
+        listing = load_commit(layout.store, shown).listing.hex()
+        directory = load(layout.store, listing, bytes(root_key))
+        _own_tree(directory)
+        return code, message, directory
+
+
+def wipe_directory(directory: Dir) -> None:
+    """Overwrite file bodies held in a tree returned by open_committed."""
+    for name, data in list(directory.files.items()):
+        if isinstance(data, bytearray):
+            wipe_buffer(data)
+        directory.files[name] = b""
+    for child in directory.dirs.values():
+        wipe_directory(child)
+
+
+def _judge(layout: Layout, opened, *, allow_unwitnessed: bool) -> tuple[int, str, str | None]:
+    """Return the status code, the message, and the commit a mount should show."""
     tips = _read_tips(layout)
     if not tips:
         raise VaultError("HEAD is missing")
-    with _session(layout, password) as (opened, root_key):
-        del root_key
-        accepted = set(_read_accepted(layout))
-        witnessed = set(
-            read_views(layout.witness / "log", required=not allow_unwitnessed)
-        )
-        parents = _parent_map(layout.store, set(tips) | accepted | witnessed)
-        verdict = classify(
-            accepted=accepted,
-            witnessed=witnessed,
-            tips=set(tips),
-            parents=parents,
-        )
-        if verdict.kind == "update":
-            _accept(layout, verdict.head)
-            _witness(layout, opened, verdict.head)
-            return EXIT_OK, f"update {verdict.head}"
-        if verdict.kind == "rewind":
-            stale = verdict.others[0] if verdict.others else tips[0]
-            return EXIT_REWIND, f"rewind {verdict.head} {stale}"
-        other = _split_other(verdict.head, tips, verdict.others)
-        receipt = layout.state / "receipt"
-        write_receipt(receipt, _commit_blob(layout, verdict.head), _commit_blob(layout, other))
-        text = f"split {verdict.head} {other}\n{receipt}"
-        return EXIT_SPLIT, text
+    accepted = set(_read_accepted(layout))
+    witnessed = set(read_views(layout.witness / "log", required=not allow_unwitnessed))
+    parents = _parent_map(layout.store, set(tips) | accepted | witnessed)
+    verdict = classify(
+        accepted=accepted,
+        witnessed=witnessed,
+        tips=set(tips),
+        parents=parents,
+    )
+    if verdict.kind == "update":
+        _accept(layout, verdict.head)
+        _witness(layout, opened, verdict.head)
+        return EXIT_OK, f"update {verdict.head}", verdict.head
+    if verdict.kind == "rewind":
+        stale = verdict.others[0] if verdict.others else tips[0]
+        return EXIT_REWIND, f"rewind {verdict.head} {stale}", None
+    other = _split_other(verdict.head, tips, verdict.others)
+    receipt = layout.state / "receipt"
+    write_receipt(receipt, _commit_blob(layout, verdict.head), _commit_blob(layout, other))
+    text = f"split {verdict.head} {other}\n{receipt}"
+    return EXIT_SPLIT, text, verdict.head
+
+
+def _own_tree(directory: Dir) -> None:
+    for name, data in list(directory.files.items()):
+        directory.files[name] = bytearray(data)
+    for child in directory.dirs.values():
+        _own_tree(child)
 
 
 def _sign_and_store(layout: Layout, opened, *, parents: tuple[str, ...], listing: str) -> str:

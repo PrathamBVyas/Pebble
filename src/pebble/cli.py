@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from pebble.errors import CryptoError, PasswordError
+from pebble.mount import mount_readonly
 from pebble.receipt import verify_receipt
 from pebble.vault import EXIT_OK, Layout, VaultError, commit, init, ls, put, status
 
@@ -51,6 +52,11 @@ def _run(argv: list[str] | None) -> int:
     status_cmd = _vault_parser(sub, "status")
     status_cmd.add_argument("--allow-unwitnessed", action="store_true")
     status_cmd.set_defaults(func=_cmd_status)
+
+    mount_cmd = _vault_parser(sub, "mount")
+    mount_cmd.add_argument("mountpoint")
+    mount_cmd.add_argument("--allow-unwitnessed", action="store_true")
+    mount_cmd.set_defaults(func=_cmd_mount)
 
     proof = sub.add_parser("verify-proof")
     proof.add_argument("receipt")
@@ -114,6 +120,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
         _wipe_password(password)
     print(text)
     return code
+
+
+def _cmd_mount(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        return mount_readonly(
+            _layout(args),
+            password,
+            Path(args.mountpoint),
+            allow_unwitnessed=args.allow_unwitnessed,
+        )
+    finally:
+        _wipe_password(password)
 
 
 def _cmd_proof(args: argparse.Namespace) -> int:
