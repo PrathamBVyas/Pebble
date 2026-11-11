@@ -30,3 +30,10 @@ class PasswordError(CryptoError):
 
 class FormatError(CryptoError):
     """The bytes are not a well-formed pebble cryptographic object."""
+
+
+class MergeConflict(Exception):
+    """Both sides of a merge changed the same path."""
+
+    def __init__(self) -> None:
+        super().__init__("both sides changed the same file")
