@@ -52,10 +52,13 @@ class Entry:
     parts: tuple[bytes, ...]
 
 
-def save(store: Store, directory: Dir, key: bytes) -> str:
-    """Seal a directory tree. Returns the root listing's object id."""
+def save(store: Store, directory: Dir, key: bytes, *, sync: bool = True) -> str:
+    """Seal a directory tree. Returns the root listing's object id.
+
+    sync=False writes the objects and leaves one later Store.sync to the caller.
+    """
     _preflight(directory, 0)
-    return _save(store, directory, key, 0)
+    return _save(store, directory, key, 0, sync)
 
 
 def load(store: Store, listing_id: str, key: bytes) -> Dir:
@@ -116,20 +119,20 @@ def decode_listing(plain: bytes) -> tuple[Entry, ...]:
     return tuple(entries)
 
 
-def _save(store: Store, directory: Dir, key: bytes, depth: int) -> str:
+def _save(store: Store, directory: Dir, key: bytes, depth: int, sync: bool) -> str:
     if depth > MAX_DEPTH:
         raise FormatError("directory is too deep")
     rows: list[Entry] = []
     for name in sorted(directory.dirs):
         child_key = secrets.token_bytes(32)
-        child_id = _save(store, directory.dirs[name], child_key, depth + 1)
+        child_id = _save(store, directory.dirs[name], child_key, depth + 1, sync)
         rows.append(Entry(_name_bytes(name), _DIR, child_key, (bytes.fromhex(child_id),)))
     for name in sorted(directory.files):
         file_key = secrets.token_bytes(32)
-        parts = _write_chunks(store, file_key, bytes(directory.files[name]))
+        parts = _write_chunks(store, file_key, bytes(directory.files[name]), sync)
         rows.append(Entry(_name_bytes(name), _FILE, file_key, parts))
     rows.sort(key=lambda row: row.name)
-    return _store_listing(store, key, rows)
+    return _store_listing(store, key, rows, sync)
 
 
 def _load(store: Store, listing_id: str, key: bytes, depth: int) -> Dir:
@@ -151,12 +154,14 @@ def _load(store: Store, listing_id: str, key: bytes, depth: int) -> Dir:
     return directory
 
 
-def _store_listing(store: Store, key: bytes, entries: list[Entry] | tuple[Entry, ...]) -> str:
+def _store_listing(
+    store: Store, key: bytes, entries: list[Entry] | tuple[Entry, ...], sync: bool = True
+) -> str:
     plain = _pack(entries)
     if len(plain) + NONCE_LEN + TAG_LEN > META_MAX:
         raise FormatError("object is too large")
     blob = encrypt(key, plain, LISTING_AAD)
-    return store.put(blob, kind=Kind.META)
+    return store.put(blob, kind=Kind.META, sync=sync)
 
 
 def _pack(entries: list[Entry] | tuple[Entry, ...]) -> bytes:
@@ -176,23 +181,23 @@ def _pack(entries: list[Entry] | tuple[Entry, ...]) -> bytes:
     return bytes(out)
 
 
-def _write_chunks(store: Store, key: bytes, plaintext: bytes) -> tuple[bytes, ...]:
+def _write_chunks(store: Store, key: bytes, plaintext: bytes, sync: bool) -> tuple[bytes, ...]:
     parts: list[bytes] = []
     offset = 0
     index = 0
     while offset < len(plaintext):
         block = plaintext[offset : offset + PLAIN_CHUNK_MAX]
-        parts.append(_put_chunk(store, key, block, index))
+        parts.append(_put_chunk(store, key, block, index, sync))
         offset += len(block)
         index += 1
     return tuple(parts)
 
 
-def _put_chunk(store: Store, key: bytes, block: bytes, index: int) -> bytes:
+def _put_chunk(store: Store, key: bytes, block: bytes, index: int, sync: bool = True) -> bytes:
     if len(block) > PLAIN_CHUNK_MAX:
         raise FormatError("chunk is too large")
     blob = encrypt(key, block, _chunk_aad(index))
-    object_id = store.put(blob, kind=Kind.CHUNK)
+    object_id = store.put(blob, kind=Kind.CHUNK, sync=sync)
     return bytes.fromhex(object_id)
 
 

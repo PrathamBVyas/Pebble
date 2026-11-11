@@ -17,8 +17,20 @@ from pebble.store import Kind, Store
 
 MAGIC = b"PCMT"
 VERSION = 1
+GRANT_VERSION = 2
 HASH_LEN = 32
 MAX_PARENTS = 2
+MAX_GRANTS = 1024
+
+
+@dataclass(frozen=True)
+class Grant:
+    """One folder key sealed to one member. The path and the box are signed."""
+
+    path: bytes
+    listing: bytes
+    recipient: bytes
+    sealed: bytes
 
 
 @dataclass(frozen=True)
@@ -29,6 +41,7 @@ class Commit:
     listing: bytes
     author: bytes
     signature: bytes
+    grants: tuple[Grant, ...] = ()
 
 
 def create_commit(*, parents: Sequence[str], listing: str, seed: bytes) -> bytes:
@@ -40,6 +53,19 @@ def create_commit(*, parents: Sequence[str], listing: str, seed: bytes) -> bytes
     return body + sign(seed, body)
 
 
+def create_granted_commit(
+    *, parents: Sequence[str], listing: str, seed: bytes, grants: Sequence[Grant]
+) -> bytes:
+    """Sign a commit that carries folder grants. Version 1 commits stay grant-free."""
+    raw_parents = tuple(_object_id(parent) for parent in parents)
+    if len(raw_parents) > MAX_PARENTS:
+        raise FormatError("commit has too many parents")
+    if len(grants) > MAX_GRANTS:
+        raise FormatError("commit has too many grants")
+    body = _grant_body(raw_parents, _object_id(listing), public_key(seed), tuple(grants))
+    return body + sign(seed, body)
+
+
 def verify_commit(blob: bytes) -> Commit:
     """Check the signature, then return the commit. A bad signature raises."""
     if isinstance(blob, str) or not isinstance(blob, (bytes, bytearray)):
@@ -47,8 +73,10 @@ def verify_commit(blob: bytes) -> Commit:
     data = bytes(blob)
     if len(data) < 4 or data[:4] != MAGIC:
         raise FormatError("not a pebble commit")
-    if len(data) < 6 or data[4] != VERSION:
+    if len(data) < 6 or data[4] not in (VERSION, GRANT_VERSION):
         raise FormatError("commit is not valid")
+    if data[4] == GRANT_VERSION:
+        return _verify_grants(data)
     parent_count = data[5]
     if parent_count > MAX_PARENTS:
         raise FormatError("commit has too many parents")
@@ -89,6 +117,88 @@ def lineage(store: Store, tip: str) -> tuple[Commit, ...]:
         if not commit.parents:
             return tuple(found)
         current = commit.parents[0].hex()
+
+
+def _verify_grants(data: bytes) -> Commit:
+    parent_count = data[5]
+    if parent_count > MAX_PARENTS:
+        raise FormatError("commit has too many parents")
+    pos = 6 + parent_count * HASH_LEN
+    if len(data) < pos + HASH_LEN + HASH_LEN + 2:
+        raise FormatError("commit is truncated")
+    listing = data[pos : pos + HASH_LEN]
+    pos += HASH_LEN
+    author = data[pos : pos + HASH_LEN]
+    pos += HASH_LEN
+    grant_count = int.from_bytes(data[pos : pos + 2], "big")
+    pos += 2
+    if grant_count > MAX_GRANTS:
+        raise FormatError("commit has too many grants")
+    grants: list[Grant] = []
+    for _ in range(grant_count):
+        if pos + 2 > len(data):
+            raise FormatError("commit is truncated")
+        path_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2
+        if path_len < 1 or pos + path_len + HASH_LEN + HASH_LEN + 2 > len(data):
+            raise FormatError("commit is truncated")
+        path = data[pos : pos + path_len]
+        pos += path_len
+        _check_grant_path(path)
+        listing_id = data[pos : pos + HASH_LEN]
+        pos += HASH_LEN
+        recipient = data[pos : pos + HASH_LEN]
+        pos += HASH_LEN
+        sealed_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2
+        if sealed_len < 1 or pos + sealed_len > len(data):
+            raise FormatError("commit is truncated")
+        sealed = data[pos : pos + sealed_len]
+        pos += sealed_len
+        grants.append(Grant(path, listing_id, recipient, sealed))
+    if len(data) < pos + SIGNATURE_LEN or len(data) != pos + SIGNATURE_LEN:
+        raise FormatError("commit is not valid")
+    body = data[:pos]
+    signature = data[pos:]
+    verify(author, signature, body)
+    parents = tuple(
+        data[6 + index * HASH_LEN : 6 + (index + 1) * HASH_LEN] for index in range(parent_count)
+    )
+    return Commit(parents, listing, author, signature, tuple(grants))
+
+
+def _grant_body(
+    parents: tuple[bytes, ...], listing: bytes, author: bytes, grants: tuple[Grant, ...]
+) -> bytes:
+    out = bytearray(MAGIC)
+    out.append(GRANT_VERSION)
+    out.append(len(parents))
+    for parent in parents:
+        out += parent
+    out += listing
+    out += author
+    out += len(grants).to_bytes(2, "big")
+    for grant in grants:
+        _check_grant_path(grant.path)
+        if len(grant.listing) != HASH_LEN or len(grant.recipient) != HASH_LEN:
+            raise FormatError("grant is not valid")
+        if not grant.sealed or len(grant.sealed) > 65535:
+            raise FormatError("grant is not valid")
+        out += len(grant.path).to_bytes(2, "big")
+        out += grant.path
+        out += grant.listing
+        out += grant.recipient
+        out += len(grant.sealed).to_bytes(2, "big")
+        out += grant.sealed
+    return bytes(out)
+
+
+def _check_grant_path(path: bytes) -> None:
+    if not path or len(path) > 1024 or b"\x00" in path or path.startswith(b"/"):
+        raise FormatError("grant path is not valid")
+    for part in path.split(b"/"):
+        if part in (b"", b".", b"..", b"..."):
+            raise FormatError("grant path is not valid")
 
 
 def _body(parents: tuple[bytes, ...], listing: bytes, author: bytes) -> bytes:
