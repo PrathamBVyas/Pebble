@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pebble.errors import PasswordError
+from pebble.store import Store
 from pebble.vault import Layout, commit, init, ls, put, read_file, status
 
 
@@ -100,6 +101,34 @@ def test_rewind_names_the_hidden_head_and_split_writes_a_receipt(tmp_path: Path)
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.splitlines() == ["fork", second, sibling]
+
+
+def test_a_save_syncs_once_for_many_chunks(tmp_path: Path, monkeypatch):
+    layout = _layout(tmp_path)
+    init(layout, _password())
+    syncs: list[str] = []
+    flags: list[bool] = []
+    original_sync = Store.sync
+    original_put = Store.put
+
+    def counting_sync(self):
+        syncs.append("sync")
+        return original_sync(self)
+
+    def counting_put(self, data, *, kind, sync=True):
+        flags.append(sync)
+        return original_put(self, data, kind=kind, sync=sync)
+
+    monkeypatch.setattr(Store, "sync", counting_sync)
+    monkeypatch.setattr(Store, "put", counting_put)
+    body = b"chunk" * (64 * 1024)
+    put(layout, _password(), _write(tmp_path, "wide", body), "wide.bin")
+    assert flags and all(flag is False for flag in flags)
+    staged = syncs.count("sync")
+    commit(layout, _password())
+    assert syncs.count("sync") == staged + 1
+    assert all(flag is False for flag in flags)
+    assert read_file(layout, _password(), "wide.bin") == body
 
 
 def test_missing_witness_refuses_open(tmp_path: Path):

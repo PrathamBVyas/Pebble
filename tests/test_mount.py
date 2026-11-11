@@ -85,32 +85,145 @@ def _put(layout: Layout, tmp_path: Path, body: bytes, name: str) -> None:
     put(layout, bytearray(b"mount-password"), local, name)
 
 
-def _mount(layout: Layout, tmp_path: Path, mountpoint: Path) -> subprocess.Popen:
+def _mount(
+    layout: Layout, tmp_path: Path, mountpoint: Path, *, read_write: bool = False
+) -> subprocess.Popen:
     password = tmp_path / "password"
     password.write_text("mount-password")
-    return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "pebble",
-            "mount",
-            str(layout.cipher),
-            str(mountpoint),
-            "--state",
-            str(layout.state),
-            "--witness",
-            str(layout.witness),
-            "--password-file",
-            str(password),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    command = [
+        sys.executable,
+        "-m",
+        "pebble",
+        "mount",
+        str(layout.cipher),
+        str(mountpoint),
+        "--state",
+        str(layout.state),
+        "--witness",
+        str(layout.witness),
+        "--password-file",
+        str(password),
+    ]
+    if read_write:
+        command.append("--read-write")
+    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def test_vim_rename_mkdir_and_unlink(tmp_path: Path):
+    layout = _vault(tmp_path)
+    _put(layout, tmp_path, b"before", "file.txt")
+    commit(layout, bytearray(b"mount-password"))
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+    process = _mount(layout, tmp_path, mountpoint, read_write=True)
+    try:
+        _wait_until_mounted(process, mountpoint / "file.txt")
+        temporary = mountpoint / ".file.txt.swp"
+        fd = os.open(temporary, os.O_CREAT | os.O_RDWR, 0o644)
+        os.write(fd, b"after")
+        os.fsync(fd)
+        os.close(fd)
+        os.rename(temporary, mountpoint / "file.txt")
+        os.mkdir(mountpoint / "folder")
+        note = mountpoint / "folder" / "gone.txt"
+        fd = os.open(note, os.O_CREAT | os.O_RDWR, 0o644)
+        os.write(fd, b"temp")
+        os.fsync(fd)
+        os.close(fd)
+        os.unlink(note)
+    finally:
+        _unmount(mountpoint, process)
+    assert process.returncode == 0, _output(process)
+    reread = _mount(layout, tmp_path, mountpoint)
+    try:
+        _wait_until_mounted(reread, mountpoint / "file.txt")
+        assert (mountpoint / "file.txt").read_bytes() == b"after"
+        assert not temporary.exists()
+        assert (mountpoint / "folder").is_dir()
+        assert not note.exists()
+    finally:
+        _unmount(mountpoint, reread)
+    assert reread.returncode == 0, _output(reread)
+
+
+def test_kill_during_write_keeps_the_previous_save(tmp_path: Path):
+    layout = _vault(tmp_path)
+    _put(layout, tmp_path, b"previous-save", "one.txt")
+    commit(layout, bytearray(b"mount-password"))
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+    process = _mount(layout, tmp_path, mountpoint, read_write=True)
+    writer = None
+    try:
+        _wait_until_mounted(process, mountpoint / "one.txt")
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys,time; fd=os.open(sys.argv[1], os.O_RDWR); "
+                "os.write(fd, b'killed-write-should-not-land'); time.sleep(60)",
+                str(mountpoint / "one.txt"),
+            ]
+        )
+        time.sleep(0.5)
+        os.kill(writer.pid, 9)
+        writer.wait(timeout=5)
+    finally:
+        if writer is not None and writer.poll() is None:
+            writer.kill()
+            writer.wait(timeout=5)
+        _unmount(mountpoint, process)
+    reread = _mount(layout, tmp_path, mountpoint)
+    try:
+        _wait_until_mounted(reread, mountpoint / "one.txt")
+        assert (mountpoint / "one.txt").read_bytes() == b"previous-save"
+    finally:
+        _unmount(mountpoint, reread)
+
+
+def test_sixty_four_mib_round_trip(tmp_path: Path):
+    layout = _vault(tmp_path)
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+    payload = bytes(64 * 1024 * 1024)
+    process = _mount(layout, tmp_path, mountpoint, read_write=True)
+    try:
+        _wait_until_mounted(process, mountpoint)
+        started = time.perf_counter()
+        fd = os.open(mountpoint / "big.bin", os.O_CREAT | os.O_RDWR, 0o644)
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            offset += os.write(fd, view[offset : offset + 1024 * 1024])
+        os.fsync(fd)
+        os.close(fd)
+        write_seconds = time.perf_counter() - started
+    finally:
+        _unmount(mountpoint, process)
+    assert process.returncode == 0, _output(process)
+    reread = _mount(layout, tmp_path, mountpoint)
+    try:
+        _wait_until_mounted(reread, mountpoint / "big.bin")
+        started = time.perf_counter()
+        found = (mountpoint / "big.bin").read_bytes()
+        read_seconds = time.perf_counter() - started
+        assert found == payload
+    finally:
+        _unmount(mountpoint, reread)
+    print(f"64MiB write {write_seconds:.3f}s read {read_seconds:.3f}s")
+
+
+def _unmount(mountpoint: Path, process: subprocess.Popen) -> None:
+    subprocess.run(["fusermount3", "-u", str(mountpoint)], check=False)
+    if process.poll() is None:
+        process.wait(timeout=15)
 
 
 def _wait_until_mounted(process: subprocess.Popen, marker: Path) -> None:
-    for _ in range(50):
-        if marker.exists():
+    mountpoint = marker if marker.is_dir() else marker.parent
+    for _ in range(80):
+        mounted = os.path.ismount(mountpoint)
+        if mounted and (marker.is_dir() or marker.exists()):
             return
         if process.poll() is not None:
             raise AssertionError(_output(process))

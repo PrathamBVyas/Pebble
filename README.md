@@ -21,7 +21,7 @@ pebble verify-proof RECEIPT
 
 `status` exits 0 on an update, 2 on a rewind, and 3 on a split. `verify-proof` checks a receipt with no password.
 
-A read-only mount shows the committed files. It does not move HEAD. Unmount with `fusermount3 -u`.
+A mount shows the committed files. Without `--read-write` it refuses writes. With `--read-write`, fsync, rename, unlink, rmdir, and mkdir each publish one save: the new objects are synced once, then HEAD is renamed. Closing a file without fsync does not publish. Unmount with `fusermount3 -u`.
 
 ```
 pebble mount CIPHER MOUNTPOINT --state STATE --witness WITNESS --password-file FILE

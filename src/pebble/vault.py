@@ -63,9 +63,9 @@ def init(layout: Layout, password: bytearray) -> str:
     try:
         _atomic_write(layout.cipher / "keybag", blob)
         _atomic_write(layout.cipher / "root.seal", seal(opened.exchange_public, bytes(root_key)))
-        listing = save(layout.store, Dir(), bytes(root_key))
-        commit_id = _sign_and_store(layout, opened, parents=(), listing=listing)
-        _write_head(layout, commit_id)
+        listing = save(layout.store, Dir(), bytes(root_key), sync=False)
+        commit_id = _sign_and_store(layout, opened, parents=(), listing=listing, sync=False)
+        _durable_head(layout, commit_id)
         _accept(layout, commit_id)
         _witness(layout, opened, commit_id)
         return commit_id
@@ -81,7 +81,8 @@ def put(layout: Layout, password: bytearray, local: Path, vault_path: str) -> No
         del opened
         directory = _editable(layout, root_key)
         _place(directory, _parts(vault_path), data)
-        listing = save(layout.store, directory, bytes(root_key))
+        listing = save(layout.store, directory, bytes(root_key), sync=False)
+        layout.store.sync()
         _atomic_write(layout.cipher / "STAGED", (listing + "\n").encode())
 
 
@@ -119,13 +120,8 @@ def commit(layout: Layout, password: bytearray) -> str:
     listing = _hash_line(staged_path, "STAGED")
     with _session(layout, password) as (opened, root_key):
         del root_key
-        parent = _read_head(layout)
-        parents = (parent,) if parent else ()
-        commit_id = _sign_and_store(layout, opened, parents=parents, listing=listing)
-        _write_head(layout, commit_id)
+        commit_id = commit_listing(layout, opened, listing)
         staged_path.unlink()
-        _accept(layout, commit_id)
-        _witness(layout, opened, commit_id)
         return commit_id
 
 
@@ -201,13 +197,32 @@ def _own_tree(directory: Dir) -> None:
         _own_tree(child)
 
 
-def _sign_and_store(layout: Layout, opened, *, parents: tuple[str, ...], listing: str) -> str:
+def commit_listing(layout: Layout, opened, listing: str) -> str:
+    """Sign one listing, sync the new objects once, and rename HEAD."""
+    parent = _read_head(layout)
+    parents = (parent,) if parent else ()
+    commit_id = _sign_and_store(layout, opened, parents=parents, listing=listing, sync=False)
+    _durable_head(layout, commit_id)
+    _accept(layout, commit_id)
+    _witness(layout, opened, commit_id)
+    return commit_id
+
+
+def commit_directory(layout: Layout, opened, root_key: bytearray, directory: Dir) -> str:
+    """Seal a tree and publish it as one save."""
+    listing = save(layout.store, directory, bytes(root_key), sync=False)
+    return commit_listing(layout, opened, listing)
+
+
+def _sign_and_store(
+    layout: Layout, opened, *, parents: tuple[str, ...], listing: str, sync: bool
+) -> str:
     seed = opened._copy_signing()
     try:
         blob = create_commit(parents=parents, listing=listing, seed=seed)
     finally:
         wipe_buffer(seed)
-    return layout.store.put(blob, kind=Kind.META)
+    return layout.store.put(blob, kind=Kind.META, sync=sync)
 
 
 def _session(layout: Layout, password: bytearray):
@@ -309,8 +324,27 @@ def _read_tips(layout: Layout) -> list[str]:
     return tips
 
 
-def _write_head(layout: Layout, commit_id: str) -> None:
-    _atomic_write(layout.cipher / "HEAD", (commit_id + "\n").encode())
+def _durable_head(layout: Layout, commit_id: str) -> None:
+    """One filesystem sync, then rename HEAD onto the new commit."""
+    path = layout.cipher / "HEAD"
+    fd, tmp_name = tempfile.mkstemp(prefix=".pebble-tmp-", dir=layout.cipher)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write((commit_id + "\n").encode())
+            handle.flush()
+        layout.store.sync()
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    directory = os.open(layout.cipher, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _accept(layout: Layout, commit_id: str) -> None:

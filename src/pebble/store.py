@@ -9,6 +9,7 @@ the file is read, and therefore before anything parses it.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import stat
@@ -44,8 +45,12 @@ class Store:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def put(self, data: bytes, *, kind: Kind) -> str:
-        """Store data and return its hex SHA-256. Oversize data is refused."""
+    def put(self, data: bytes, *, kind: Kind, sync: bool = True) -> str:
+        """Store data and return its hex SHA-256. Oversize data is refused.
+
+        sync=False leaves the durability of this object to a later sync call.
+        A save uses that so one file is not fsynced once per chunk.
+        """
         if isinstance(data, str) or not isinstance(data, (bytes, bytearray)):
             raise TypeError("object must be bytes")
         body = bytes(data)
@@ -61,7 +66,8 @@ class Store:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(body)
                 handle.flush()
-                os.fsync(handle.fileno())
+                if sync:
+                    os.fsync(handle.fileno())
             os.replace(tmp_name, path)
         except Exception:
             try:
@@ -69,8 +75,17 @@ class Store:
             except OSError:
                 pass
             raise
-        _fsync_dir(path.parent)
+        if sync:
+            _fsync_dir(path.parent)
         return object_id
+
+    def sync(self) -> None:
+        """Flush every object written to this filesystem. One call per save."""
+        fd = os.open(self.root, os.O_RDONLY)
+        try:
+            _syncfs(fd)
+        finally:
+            os.close(fd)
 
     def get(self, object_id: str, *, kind: Kind) -> bytes:
         """Return the object. Size, truncation, and the hash are checked first."""
@@ -115,6 +130,14 @@ def _check_id(object_id: str) -> str:
     if any(char not in "0123456789abcdef" for char in object_id):
         raise FormatError("object id is not valid")
     return object_id
+
+
+def _syncfs(fd: int) -> None:
+    """syncfs(2). This interpreter does not expose os.syncfs."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syncfs(fd) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 def _fsync_dir(directory: Path) -> None:

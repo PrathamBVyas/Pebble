@@ -56,6 +56,7 @@ def _run(argv: list[str] | None) -> int:
     mount_cmd = _vault_parser(sub, "mount")
     mount_cmd.add_argument("mountpoint")
     mount_cmd.add_argument("--allow-unwitnessed", action="store_true")
+    mount_cmd.add_argument("--read-write", action="store_true")
     mount_cmd.set_defaults(func=_cmd_mount)
 
     proof = sub.add_parser("verify-proof")
@@ -130,6 +131,7 @@ def _cmd_mount(args: argparse.Namespace) -> int:
             password,
             Path(args.mountpoint),
             allow_unwitnessed=args.allow_unwitnessed,
+            read_write=args.read_write,
         )
     finally:
         _wipe_password(password)
