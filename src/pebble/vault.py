@@ -12,6 +12,7 @@ head where it was.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import tempfile
@@ -71,6 +72,7 @@ def init(layout: Layout, password: bytearray) -> str:
         _durable_head(layout, commit_id)
         _accept(layout, commit_id)
         _witness(layout, opened, commit_id)
+        _note_keybag(layout, opened, blob)
         return commit_id
     finally:
         wipe_buffer(root_key)
@@ -244,20 +246,140 @@ def keygen(password: bytearray, keybag_path: Path, public_path: Path) -> None:
 
 def add_user(
     layout: Layout, password: bytearray, name: str, keybag_path: Path, public_path: Path
-) -> None:
-    """Copy a member's keybag and public keys into the cipher directory."""
+) -> str:
+    """Copy a member into the vault and seal home/<name> to that member.
+
+    The home folder is the set of files that member owns. Another member
+    cannot open it. Returns the commit that publishes the grant.
+    """
     _member_name(name)
     public = Path(public_path).read_bytes()
     if len(public) != 64:
         raise VaultError("member public key is not valid")
+    keybag_bytes = Path(keybag_path).read_bytes()
     with _session(layout, password) as (opened, root_key):
-        del opened, root_key
-        _atomic_write(layout.cipher / "keybags" / name, Path(keybag_path).read_bytes())
+        _require_clean(layout)
+        _atomic_write(layout.cipher / "keybags" / name, keybag_bytes)
         _atomic_write(layout.cipher / "members" / name, public)
+        volume = _editable(layout, root_key)
+        home_path = f"home/{name}"
+        _ensure_dir(volume, home_path)
+        listing = store_volume(layout.store, volume, sync=False)
+        previous = _parent_grants(layout)
+        recipients = _recipients(previous, home_path)
+        recipients.add(opened.exchange_public)
+        recipients.add(public[32:])
+        grants = grants_for(previous, volume, opened, home_path, recipients=recipients)
+        return commit_listing(layout, opened, listing, grants=grants)
+
+
+def remove_user(layout: Layout, password: bytearray, name: str) -> str:
+    """Drop a member and rotate every folder that was sealed to them.
+
+    Files already in those folders stay in the old listings, so a person who
+    could read them still can. Anything written afterwards is sealed only to
+    whoever remains. The member's keybag copy is removed from the cipher
+    directory. Returns the new commit id.
+    """
+    _member_name(name)
+    with _session(layout, password) as (opened, root_key):
+        _require_clean(layout)
+        removed = _member_exchange(layout, name)
+        volume = _editable(layout, root_key)
+        previous = _parent_grants(layout)
+        paths: list[str] = []
+        seen: set[str] = set()
+        for grant in previous:
+            if grant.recipient != removed:
+                continue
+            path = grant.path.decode("utf-8")
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+        home_path = f"home/{name}"
+        if home_path not in seen:
+            try:
+                walk(volume, home_path)
+            except KeyError:
+                pass
+            else:
+                paths.append(home_path)
+        for path in paths:
+            folder = walk(volume, path)
+            wipe_buffer(folder.key)
+            folder.key = bytearray(secrets.token_bytes(32))
+            folder.dirty = True
+        listing = store_volume(layout.store, volume, sync=False) if paths else _current_listing(layout)
+        current = previous
+        all_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for grant in previous:
+            path = grant.path.decode("utf-8")
+            if path not in seen_paths:
+                seen_paths.add(path)
+                all_paths.append(path)
+        for path in paths:
+            if path not in seen_paths:
+                all_paths.append(path)
+        for path in all_paths:
+            recipients = _recipients(current, path)
+            recipients.add(opened.exchange_public)
+            recipients.discard(removed)
+            current = grants_for(current, volume, opened, path, recipients=recipients)
+        commit_id = commit_listing(layout, opened, listing, grants=current)
+        for relative in (Path("members") / name, Path("keybags") / name):
+            target = layout.cipher / relative
+            if target.is_file():
+                target.unlink()
+        return commit_id
+
+
+def change_password(layout: Layout, old_password: bytearray, new_password: bytearray) -> None:
+    """Rewrap the volume keybag. The signing key and the root key stay.
+
+    The old password stops opening the current keybag. This device records
+    the new keybag hash outside the cipher directory, so putting the previous
+    keybag file back is refused here. A copy of the old keybag that this
+    device never saw still unwraps with the old password. Both buffers are wiped.
+    """
+    path = layout.cipher / "keybag"
+    blob = path.read_bytes()
+    accepted = _accepted_keybag(layout)
+    if accepted is not None and _keybag_digest(blob) != accepted:
+        wipe_buffer(old_password)
+        wipe_buffer(new_password)
+        raise VaultError("keybag was replaced")
+    fresh = bytearray(new_password)
+    try:
+        rewritten = Keybag.rewrap(blob, old_password, new_password)
+    except Exception:
+        wipe_buffer(fresh)
+        raise
+    digest = _keybag_digest(rewritten)
+    _atomic_write(layout.state / "keybag-next", (digest + "\n").encode())
+    _atomic_write(path, rewritten)
+    opened = Keybag.unlock(fresh, rewritten)
+    try:
+        _note_keybag(layout, opened, rewritten)
+    finally:
+        opened.close()
+    pending = layout.state / "keybag-next"
+    if pending.is_file():
+        pending.unlink()
+
+
+def change_keybag(path: Path, old_password: bytearray, new_password: bytearray) -> None:
+    """Rewrap one member keybag file. Both password buffers are wiped."""
+    rewritten = Keybag.rewrap(path.read_bytes(), old_password, new_password)
+    _atomic_write(path, rewritten)
 
 
 def share(layout: Layout, password: bytearray, path: str, name: str) -> str:
-    """Seal one folder key to a member. The vault root stays with the owner."""
+    """Seal one folder key to a member. Files in that folder are shared with it.
+
+    A single file is shared by putting it in a folder and sharing that folder.
+    The vault root stays with the owner.
+    """
     if not path:
         raise VaultError("cannot share the vault root")
     recipient = _member_exchange(layout, name)
@@ -266,7 +388,7 @@ def share(layout: Layout, password: bytearray, path: str, name: str) -> str:
         try:
             folder = walk(volume, path)
         except KeyError as exc:
-            raise VaultError("path is not a folder") from exc
+            raise VaultError("path is not a folder; share the folder that holds the file") from exc
         if folder is volume:
             raise VaultError("cannot share the vault root")
         if folder.listing_id is None or folder.dirty:
@@ -396,6 +518,7 @@ class _Unlock:
         blob = (self._layout.cipher / "keybag").read_bytes()
         self._opened = Keybag.unlock(self._password, blob)
         try:
+            _check_keybag(self._layout, self._opened, blob)
             sealed = (self._layout.cipher / "root.seal").read_bytes()
             self._root_key = bytearray(self._opened.open_sealed(sealed))
         except Exception:
@@ -544,6 +667,82 @@ def _witness(layout: Layout, opened, commit_id: str) -> None:
         opened.signing_public,
         opened.sign,
     )
+
+
+def _require_clean(layout: Layout) -> None:
+    if (layout.cipher / "STAGED").is_file():
+        raise VaultError("commit staged files first")
+
+
+def _ensure_dir(volume: VDir, path: str) -> VDir:
+    node = volume
+    for part in path.split("/"):
+        child = node.dirs.get(part)
+        if isinstance(child, VDir):
+            node = child
+            continue
+        if child is not None or part in node.files:
+            raise VaultError("path is not a folder")
+        node = node.add_dir(part)
+    return node
+
+
+def _current_listing(layout: Layout) -> str:
+    head = _read_head(layout)
+    if head is None:
+        raise VaultError("HEAD is missing")
+    return load_commit(layout.store, head).listing.hex()
+
+
+def _keybag_digest(blob: bytes) -> str:
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _keybag_log(layout: Layout) -> Path:
+    return layout.witness / "keybag"
+
+
+def _accepted_keybag(layout: Layout) -> str | None:
+    path = _keybag_log(layout)
+    if not path.is_file():
+        return None
+    seen = read_views(path, required=True)
+    return seen[-1] if seen else None
+
+
+def _pending_keybag(layout: Layout) -> str:
+    path = layout.state / "keybag-next"
+    if not path.is_file():
+        return ""
+    text = path.read_text().strip()
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        return ""
+    return text
+
+
+def _note_keybag(layout: Layout, opened, blob: bytes) -> None:
+    append_view(_keybag_log(layout), _keybag_digest(blob), opened.signing_public, opened.sign)
+
+
+def _check_keybag(layout: Layout, opened, blob: bytes) -> None:
+    """Accept the current keybag, or the one a crashed password change wrote."""
+    digest = _keybag_digest(blob)
+    accepted = _accepted_keybag(layout)
+    pending = _pending_keybag(layout)
+    if accepted is None or digest == pending:
+        _note_keybag(layout, opened, blob)
+        _clear_pending(layout)
+        return
+    if digest == accepted:
+        _clear_pending(layout)
+        return
+    raise VaultError("keybag was replaced")
+
+
+def _clear_pending(layout: Layout) -> None:
+    path = layout.state / "keybag-next"
+    if path.is_file():
+        path.unlink()
 
 
 def _parent_map(store: Store, seeds: set[str]) -> dict[str, tuple[str, ...]]:
