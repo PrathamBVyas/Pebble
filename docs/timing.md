@@ -1,11 +1,11 @@
 # Timing
 
-One 64 MiB file written through a read-write mount, then one fsync, then an
-unmount and a read of the same file. The save syncs the new objects once
-and renames HEAD. The number is from one run.
+The fuller table, including password refusal, tamper, and rewind, is in [benchmarks.md](benchmarks.md). This note is the single 64 MiB mount from that same run.
 
-Machine: Linux 6.12.113+ x86_64, host name `cursor`
+Machine: Linux 6.12.113+ x86_64, Ubuntu 24.04.5 LTS
 libfuse: 3.14.0
 
-Write and fsync: 0.360 s
-Read back: 0.057 s
+Write and fsync: 0.380 s
+Read back: 0.026 s
+
+The save syncs the new objects once and then renames HEAD.

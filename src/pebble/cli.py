@@ -20,11 +20,14 @@ from pebble.vault import (
     Layout,
     VaultError,
     add_user,
+    change_keybag,
+    change_password,
     commit,
     init,
     keygen,
     ls,
     put,
+    remove_user,
     revoke,
     share,
     status,
@@ -84,6 +87,19 @@ def _run(argv: list[str] | None) -> int:
     user_cmd.add_argument("--keybag", required=True)
     user_cmd.add_argument("--public", required=True)
     user_cmd.set_defaults(func=_cmd_user)
+
+    remove_cmd = _vault_parser(sub, "remove-user")
+    remove_cmd.add_argument("--name", required=True)
+    remove_cmd.set_defaults(func=_cmd_remove_user)
+
+    passwd_cmd = sub.add_parser("passwd")
+    passwd_cmd.add_argument("cipher", nargs="?")
+    passwd_cmd.add_argument("--state")
+    passwd_cmd.add_argument("--witness")
+    passwd_cmd.add_argument("--password-file")
+    passwd_cmd.add_argument("--new-password-file", required=True)
+    passwd_cmd.add_argument("--keybag")
+    passwd_cmd.set_defaults(func=_cmd_passwd)
 
     share_cmd = _vault_parser(sub, "share")
     share_cmd.add_argument("path")
@@ -193,9 +209,35 @@ def _cmd_keygen(args: argparse.Namespace) -> int:
 def _cmd_user(args: argparse.Namespace) -> int:
     password = _password(args)
     try:
-        add_user(_layout(args), password, args.name, Path(args.keybag), Path(args.public))
+        print(add_user(_layout(args), password, args.name, Path(args.keybag), Path(args.public)))
     finally:
         _wipe_password(password)
+    return EXIT_OK
+
+
+def _cmd_remove_user(args: argparse.Namespace) -> int:
+    password = _password(args)
+    try:
+        print(remove_user(_layout(args), password, args.name))
+    finally:
+        _wipe_password(password)
+    return EXIT_OK
+
+
+def _cmd_passwd(args: argparse.Namespace) -> int:
+    if args.keybag and args.cipher:
+        raise VaultError("pass either the volume or --keybag")
+    old = _password(args)
+    new = _password_file(args.new_password_file)
+    try:
+        if args.keybag:
+            change_keybag(Path(args.keybag), old, new)
+        else:
+            change_password(_layout(args), old, new)
+    finally:
+        _wipe_password(old)
+        _wipe_password(new)
+    print("password changed")
     return EXIT_OK
 
 
@@ -243,6 +285,10 @@ def _password(args: argparse.Namespace) -> bytearray:
     path = args.password_file or os.environ.get("PEBBLE_PASSWORD_FILE")
     if not path:
         raise VaultError("missing password file")
+    return _password_file(path)
+
+
+def _password_file(path: str) -> bytearray:
     raw = bytearray(Path(path).read_bytes())
     if raw.endswith(b"\n"):
         del raw[-1]
